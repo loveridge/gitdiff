@@ -16,3 +16,7 @@ plan.md
 *.vsix
 demo/**
 scripts/**
+flake.nix
+flake.lock
+result
+result-*/**

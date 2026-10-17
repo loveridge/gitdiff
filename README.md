@@ -155,6 +155,16 @@ The ref is pinned to a verified 40-char SHA at open time (so the left pane is re
 
 ## Development
 
+With Nix, enter the development shell first (Node.js 22, npm, Git, and native
+dependency build tools are included):
+
+```bash
+nix develop
+```
+
+When first adding the flake to a Git checkout, run `git add flake.nix flake.lock`
+so Nix can see the new files.
+
 ```bash
 npm install
 npm run compile      # tsc
@@ -165,6 +175,18 @@ npm run package      # build a .vsix
 ```
 
 Press **F5** in VS Code to launch an Extension Development Host with the extension loaded.
+
+To build the VSIX directly with Nix, including type-checking and unit tests:
+
+```bash
+nix build                 # also available as nix build .#vsix
+ls result/*.vsix
+code --install-extension result/*.vsix
+```
+
+The Nix build installs dependencies from `package-lock.json` using its integrity
+hashes; it does not require running `npm install` first or maintaining a separate
+Nix dependency hash.
 
 ## License
 
