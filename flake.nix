@@ -41,7 +41,9 @@
               npmDeps = pkgs.importNpmLock {
                 npmRoot = ./.;
               };
-              npmConfigHook = pkgs.importNpmLock.npmConfigHook.override { inherit nodejs; };
+              npmConfigHook = (pkgs.callPackage (pkgs.path + "/pkgs/build-support/node/import-npm-lock/hooks") {
+                inherit nodejs;
+              }).npmConfigHook;
               nativeBuildInputs = nativeTools ++ [ pkgs.git ];
               buildInputs = nativeLibraries;
 
