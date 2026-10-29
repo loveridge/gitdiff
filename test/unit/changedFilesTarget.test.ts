@@ -166,3 +166,176 @@ describe('ChangedFilesProvider view mode', () => {
     provider.dispose();
   });
 });
+
+describe('ChangedFilesProvider reviews', () => {
+  const fs = require('fs') as typeof import('fs');
+  const os = require('os') as typeof import('os');
+  const path = require('path') as typeof import('path');
+  let root: string;
+  let store: Map<string, unknown>;
+  let providers: any[];
+  let edit: (event: any) => void;
+  let changes: Array<(uri: any) => void>;
+  const originalEdit = stub.workspace.onDidChangeTextDocument;
+  const originalWatcher = stub.workspace.createFileSystemWatcher;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitdiff-review-'));
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src/a.ts'), 'first');
+    store = new Map();
+    providers = [];
+    changes = [];
+    stub.workspace.onDidChangeTextDocument = (cb: typeof edit) => {
+      edit = cb;
+      return { dispose() {} };
+    };
+    stub.workspace.createFileSystemWatcher = () => ({
+      onDidChange: (cb: any) => { changes.push(cb); return { dispose() {} }; },
+      onDidCreate: () => ({ dispose() {} }),
+      onDidDelete: () => ({ dispose() {} }),
+      dispose() {},
+    });
+  });
+  afterEach(() => {
+    for (const provider of providers) provider.dispose();
+    stub.workspace.textDocuments = [];
+    stub.workspace.onDidChangeTextDocument = originalEdit;
+    stub.workspace.createFileSystemWatcher = originalWatcher;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  function make(): any {
+    const provider = new ChangedFilesProvider({ ...fakeGit }, {
+      get: (key: string) => store.get(key),
+      update: async (key: string, value: unknown) => { store.set(key, value); },
+    }, stub.Uri.file('/ext'));
+    providers.push(provider);
+    return provider;
+  }
+  async function check(provider: any, value = true): Promise<void> {
+    await provider.onMessage({ type: 'setReviewed', relPath: 'src/a.ts',
+      reviewed: value, reviewContext: provider.reviewContext });
+    await provider.reviewWrites;
+  }
+  it('persists a review and validates it on restart; unchanged refresh preserves it', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    await check(provider);
+    await provider.refresh();
+    assert.ok(provider.verifiedReviews.has('src/a.ts'));
+    provider.dispose();
+    const restored = make();
+    assert.strictEqual(restored.verifiedReviews.size, 0);
+    await restored.refresh();
+    assert.ok(restored.verifiedReviews.has('src/a.ts'));
+    await check(restored, false);
+    assert.strictEqual(restored.reviews.size, 0);
+  });
+  it('rejects persisted reviews when disk content changed while closed', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    await check(provider);
+    provider.dispose();
+    fs.writeFileSync(path.join(root, 'src/a.ts'), 'other');
+    const restored = make();
+    await restored.refresh();
+    assert.strictEqual(restored.reviews.size, 0);
+  });
+  it('clears immediately on unsaved edits, even hidden, and undo does not restore it', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    await check(provider);
+    edit({ document: { uri: stub.Uri.file(path.join(root, 'src/a.ts')) }, contentChanges: [{}] });
+    assert.strictEqual(provider.reviews.size, 0);
+    await provider.refresh();
+    assert.strictEqual(provider.verifiedReviews.size, 0);
+  });
+  it('invalidates an in-flight check on an editor edit', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    let finish!: (value: string) => void;
+    provider.fingerprint = () => new Promise<string>((resolve) => { finish = resolve; });
+    const pending = check(provider);
+    edit({ document: { uri: stub.Uri.file(path.join(root, 'src/a.ts')) }, contentChanges: [{}] });
+    finish('old');
+    await pending;
+    assert.strictEqual(provider.reviews.size, 0);
+  });
+  it('keeps the newest checkbox request when fingerprint reads complete out of order', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    const finishes: Array<(value: string) => void> = [];
+    provider.fingerprint = () => new Promise<string>((resolve) => { finishes.push(resolve); });
+    const first = check(provider);
+    const second = check(provider);
+    finishes[0]('old');
+    await first;
+    assert.ok(provider.reviewWatchers.has('src/a.ts'));
+    finishes[1]('new');
+    await second;
+    assert.strictEqual(provider.reviews.get('src/a.ts').fingerprint, 'new');
+  });
+  it('clears on external changes without a visible webview', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    await check(provider);
+    const uri = stub.Uri.file(path.join(root, 'src/a.ts'));
+    for (const cb of changes) cb(uri);
+    assert.strictEqual(provider.reviews.size, 0);
+  });
+  it('clears reviews when a file disappears from the list or becomes a rename', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    await check(provider);
+    provider.git.listChangedPaths = async () => [{ relPath: 'src/a.ts', status: 'R', origPath: 'old.ts' }];
+    await provider.refresh();
+    assert.strictEqual(provider.reviews.size, 0);
+    await check(provider);
+    assert.ok(provider.verifiedReviews.has('src/a.ts'));
+    provider.git.listChangedPaths = async () => [];
+    await provider.refresh();
+    assert.strictEqual(provider.reviews.size, 0);
+  });
+  it('leaves unreadable files unchecked and permits reviewing deleted files', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    const abs = path.join(root, 'src/a.ts');
+    fs.unlinkSync(abs);
+    fs.mkdirSync(abs); // readFile fails on a directory, even when tests run as root.
+    await check(provider);
+    assert.strictEqual(provider.reviews.size, 0);
+    fs.rmdirSync(abs);
+    provider.git.listChangedPaths = async () => [{ relPath: 'src/a.ts', status: 'D' }];
+    await provider.refresh();
+    await check(provider);
+    assert.ok(provider.verifiedReviews.has('src/a.ts'));
+    fs.writeFileSync(abs, 'restored');
+    await provider.refresh();
+    assert.strictEqual(provider.reviews.size, 0);
+  });
+  it('captures dirty document contents and invalidates if the restored contents differ', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    stub.workspace.textDocuments = [{ uri: stub.Uri.file(path.join(root, 'src/a.ts')),
+      isDirty: true, getText: () => 'unsaved review' }];
+    await check(provider);
+    assert.ok(provider.reviews.get('src/a.ts').fingerprint.startsWith('text:'));
+    await provider.refresh();
+    assert.ok(provider.verifiedReviews.has('src/a.ts'));
+    stub.workspace.textDocuments = [];
+    await provider.refresh();
+    assert.strictEqual(provider.reviews.size, 0);
+  });
+  it('preserves the same target and clears on a different comparison commit', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    await check(provider);
+    await provider.setTarget(TARGET, root);
+    assert.ok(provider.verifiedReviews.has('src/a.ts'));
+    const staleContext = provider.reviewContext;
+    await provider.setTarget({ ref: 'b'.repeat(40), display: 'other' }, root);
+    await provider.onMessage({ type: 'setReviewed', relPath: 'src/a.ts', reviewed: true,
+      reviewContext: staleContext });
+    assert.strictEqual(provider.reviews.size, 0);
+  });
+});

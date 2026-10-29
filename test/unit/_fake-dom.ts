@@ -15,6 +15,8 @@ export class FakeElement {
   title = '';
   id = '';
   tagName: string;
+  checked = false;
+  private listeners = new Map<string, Array<(event: any) => void>>();
 
   constructor(tagName = 'div') {
     this.tagName = tagName;
@@ -81,13 +83,24 @@ export class FakeElement {
   hasAttribute(name: string): boolean {
     return this.attrs.has(name);
   }
-  addEventListener(): void {
-    /* the script registers listeners at load; tests drive render() directly */
+  addEventListener(type: string, cb: (event: any) => void): void {
+    const callbacks = this.listeners.get(type) ?? [];
+    callbacks.push(cb);
+    this.listeners.set(type, callbacks);
   }
+  dispatch(type: string, event: any): void {
+    for (const cb of this.listeners.get(type) ?? []) cb(event);
+  }
+  querySelector(selector: string): FakeElement | null { return this.find(selector) ?? null; }
   focus(): void {}
   scrollIntoView(): void {}
-  closest(): FakeElement | null {
-    return null;
+  closest(selector: string): FakeElement | null {
+    for (const part of selector.split(',').map((s) => s.trim())) {
+      if (part.startsWith('.') && this.classList.contains(part.slice(1))) return this;
+      if (part === 'li[data-rel]' && this.hasAttribute('data-rel')) return this;
+      if (part === 'li[data-dir]' && this.hasAttribute('data-dir')) return this;
+    }
+    return this.parent?.closest(selector) ?? null;
   }
   get nextElementSibling(): FakeElement | null {
     return this.sibling(1);

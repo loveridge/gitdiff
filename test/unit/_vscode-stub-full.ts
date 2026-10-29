@@ -29,6 +29,10 @@ export const workspace = {
       return uri.fsPath === root || uri.fsPath.startsWith(root + '/');
     });
   },
+  textDocuments: [] as any[],
+  onDidChangeTextDocument(_cb: (event: any) => void) {
+    return { dispose() {} };
+  },
   onDidSaveTextDocument(_cb: (doc: unknown) => void) {
     return { dispose() {} };
   },

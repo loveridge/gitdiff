@@ -610,3 +610,43 @@ describe('Auto-refresh — gitdir watcher (e2e)', function () {
     }
   });
 });
+
+describe('Review invalidation (e2e)', function () {
+  this.timeout(30000);
+
+  it('clears reviews for real unsaved document edits and external filesystem changes', async () => {
+    const api = await getApi();
+    const root = makeRepo();
+    const abs = path.join(realRepoPath(root), 'review.txt');
+    fs.writeFileSync(abs, 'baseline\n');
+    commit(root, 'baseline');
+    const ref = git(root, ['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(abs, 'changed\n');
+    const provider = api.changedFiles as any;
+    await provider.setTarget({ ref, display: 'review' }, realRepoPath(root));
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs));
+    const check = () => provider.onMessage({ type: 'setReviewed', relPath: 'review.txt',
+      reviewed: true, reviewContext: provider.reviewContext });
+    try {
+      await check();
+      assert.ok(provider.verifiedReviews.has('review.txt'));
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(doc.uri, new vscode.Position(0, 0), 'unsaved ');
+      await vscode.workspace.applyEdit(edit);
+      assert.ok(!provider.verifiedReviews.has('review.txt'));
+      await doc.save();
+      await settle(500);
+      await provider.refresh();
+      await check();
+      assert.ok(provider.verifiedReviews.has('review.txt'));
+      for (let round = 0; round < 4 && provider.verifiedReviews.has('review.txt'); round++) {
+        fs.writeFileSync(abs, `external ${round}\n`);
+        const deadline = Date.now() + 2000;
+        while (provider.verifiedReviews.has('review.txt') && Date.now() < deadline) await settle(100);
+      }
+      assert.ok(!provider.verifiedReviews.has('review.txt'), 'external write must invalidate review');
+    } finally {
+      await provider.clearTarget();
+    }
+  });
+});

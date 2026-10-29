@@ -1,4 +1,4 @@
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -37,6 +37,10 @@ export const DEFAULT_VIEW_MODE: ViewMode = 'tree';
 
 const STATE_KEY = 'gitdiff.changedFiles.target';
 const FILTER_KEY = 'gitdiff.changedFiles.filter';
+const REVIEW_KEY = 'gitdiff.changedFiles.reviews';
+interface ReviewRecord { fingerprint: string; status: ChangeStatus; origPath?: string }
+interface ReviewState { repoRoot: string; ref: string; records: Record<string, ReviewRecord> }
+
 const VIEW_MODE_KEY = 'gitdiff.changedFiles.viewMode';
 /** Skip content search on files larger than this (5 MB). */
 const MAX_SEARCH_FILE_BYTES = 5 * 1024 * 1024;
@@ -59,7 +63,8 @@ interface PersistedTarget {
 
 interface FilesMessage {
   type: 'files';
-  files: Array<{ relPath: string; status: ChangeStatus }>;
+  files: Array<{ relPath: string; status: ChangeStatus; reviewed?: boolean }>;
+  reviewContext?: number;
   hasTarget: boolean;
   targetLabel: string;
   loading?: boolean;
@@ -95,7 +100,8 @@ interface ViewModeMessage {
   viewMode: ViewMode;
 }
 
-type OutgoingMessage = FilesMessage | InitMessage | ActiveFileMessage | ViewModeMessage;
+type OutgoingMessage = FilesMessage | InitMessage | ActiveFileMessage | ViewModeMessage
+  | { type: 'reviews'; paths: string[]; reviewContext: number };
 
 export const VIEW_ID = 'gitdiff.changedFiles';
 
@@ -122,6 +128,17 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
   /** Fires after the layout toggles; the extension mirrors it into a context key for the title-bar buttons. */
   private readonly _onDidChangeViewMode = new vscode.EventEmitter<ViewMode>();
   readonly onDidChangeViewMode = this._onDidChangeViewMode.event;
+
+  private reviews = new Map<string, ReviewRecord>();
+  private verifiedReviews = new Set<string>();
+  private reviewWatchers = new Map<string, vscode.Disposable[]>();
+  private reviewEpoch = 0;
+  // Per-file generations let independent checkbox requests finish concurrently.
+  private reviewOperations = new Map<string, number>();
+  private reviewContext = 0;
+  private reviewWrites: Promise<void> = Promise.resolve();
+  private readonly editSub: vscode.Disposable;
+  private disposed = false;
 
   private target: PersistedTarget | undefined;
   private filter: FilterState;
@@ -161,6 +178,21 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
     private readonly extensionUri: vscode.Uri,
   ) {
     this.target = workspaceState.get<PersistedTarget>(STATE_KEY);
+    const saved = workspaceState.get<ReviewState>(REVIEW_KEY);
+    if (saved?.repoRoot === this.target?.repoRoot && saved?.ref === this.target?.ref
+        && saved?.records && typeof saved.records === 'object') {
+      for (const [rel, record] of Object.entries(saved.records)) {
+        if (rel && !path.isAbsolute(rel) && !rel.split(/[\\/]/).includes('..')
+            && record && typeof record.fingerprint === 'string'
+            && typeof record.status === 'string') this.reviews.set(rel, record);
+      }
+    }
+    for (const rel of this.reviews.keys()) this.watchReview(rel);
+    this.editSub = vscode.workspace.onDidChangeTextDocument((event) => {
+      if (event.contentChanges.length && event.document.uri.scheme === 'file') {
+        this.invalidateReviewPath(event.document.uri.fsPath);
+      }
+    });
     // workspaceState is on-disk JSON that could carry stale or hand-edited
     // shapes across version bumps — sanitize before trusting.
     const persistedFilter = workspaceState.get<Partial<FilterState>>(FILTER_KEY);
@@ -178,12 +210,133 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
 
   dispose(): void {
     if (this.autoRefreshTimer) clearTimeout(this.autoRefreshTimer);
+    this.disposed = true;
+    this.reviewEpoch++;
+    this.editSub.dispose();
+    this.clearReviewWatchers();
     this.saveSub.dispose();
     for (const d of this.gitWatchers.splice(0)) d.dispose();
     for (const d of this.viewSubs.splice(0)) d.dispose();
     this._onDidChangeTarget.dispose();
     this._onDidChangeGitState.dispose();
     this._onDidChangeViewMode.dispose();
+  }
+
+  private persistReviews(): void {
+    const state: ReviewState | undefined = this.target ? {
+      repoRoot: this.target.repoRoot, ref: this.target.ref,
+      records: Object.fromEntries(this.reviews),
+    } : undefined;
+    this.reviewWrites = this.reviewWrites.catch(() => {}).then(() =>
+      this.workspaceState.update(REVIEW_KEY, state));
+    void this.reviewWrites.catch(() => {});
+  }
+
+  private postReviews(): void {
+    this.post({ type: 'reviews', paths: [...this.verifiedReviews], reviewContext: this.reviewContext });
+  }
+
+  private clearReviewWatchers(): void {
+    for (const subs of this.reviewWatchers.values()) for (const sub of subs) sub.dispose();
+    this.reviewWatchers.clear();
+  }
+
+  private watchReview(rel: string): void {
+    if (!this.target || this.reviewWatchers.has(rel)) return;
+    const abs = path.join(this.target.repoRoot, rel);
+    // Watch the parent with a literal path check: filenames may contain glob characters.
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(path.dirname(abs)), '*'));
+    const changed = (uri: vscode.Uri): void => {
+      if (uri.fsPath === abs) this.invalidateReviewPath(abs);
+    };
+    this.reviewWatchers.set(rel, [watcher, watcher.onDidChange(changed),
+      watcher.onDidCreate(changed), watcher.onDidDelete(changed)]);
+  }
+
+  private dropReview(rel: string): void {
+    this.reviewOperations.set(rel, (this.reviewOperations.get(rel) ?? 0) + 1);
+    this.reviews.delete(rel);
+    this.verifiedReviews.delete(rel);
+    for (const sub of this.reviewWatchers.get(rel) ?? []) sub.dispose();
+    this.reviewWatchers.delete(rel);
+  }
+
+  private invalidateReviewPath(abs: string): void {
+    if (!this.target) return;
+    const rel = path.relative(this.target.repoRoot, abs).split(path.sep).join('/');
+    if (!this.reviewWatchers.has(rel)) return;
+    this.reviewEpoch++;
+    this.dropReview(rel);
+    this.persistReviews();
+    this.postReviews();
+    this.scheduleAutoRefresh(false);
+  }
+
+  private resetReviews(): void {
+    this.reviewEpoch++;
+    this.reviewContext++;
+    this.reviews.clear();
+    this.verifiedReviews.clear();
+    this.clearReviewWatchers();
+    this.postReviews();
+  }
+
+  private async fingerprint(file: ChangedFile): Promise<string | undefined> {
+    const doc = vscode.workspace.textDocuments.find((d) =>
+      d.uri.scheme === 'file' && d.uri.fsPath === file.absPath);
+    if (doc?.isDirty) return 'text:' + createHash('sha256').update(doc.getText()).digest('hex');
+    try {
+      const stat = await fs.promises.lstat(file.absPath);
+      const content = stat.isSymbolicLink()
+        ? await fs.promises.readlink(file.absPath) : await fs.promises.readFile(file.absPath);
+      return 'disk:' + stat.mode + ':' + createHash('sha256').update(content).digest('hex');
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : undefined;
+    }
+  }
+
+  private async setReviewed(rel: string, checked: boolean, context: number): Promise<void> {
+    if (context !== this.reviewContext || this.disposed) return;
+    const file = this.files.find((f) => f.relPath === rel);
+    if (!file) return;
+    ++this.reviewEpoch;
+    this.dropReview(rel);
+    const operation = this.reviewOperations.get(rel);
+    if (checked) {
+      this.watchReview(rel);
+      const watcher = this.reviewWatchers.get(rel);
+      const fingerprint = await this.fingerprint(file);
+      if (operation !== this.reviewOperations.get(rel) || context !== this.reviewContext || this.disposed) {
+        // A newer request may own this path's watcher now.
+        if (!this.reviews.has(rel) && this.reviewWatchers.get(rel) === watcher) this.dropReview(rel);
+        this.persistReviews();
+        this.postReviews();
+        return;
+      }
+      const current = this.files.find((f) => f.relPath === rel);
+      if (fingerprint && current?.status === file.status && current?.origPath === file.origPath) {
+        this.reviews.set(rel, { fingerprint, status: file.status, origPath: file.origPath });
+        this.verifiedReviews.add(rel);
+      } else this.dropReview(rel);
+    }
+    this.persistReviews();
+    this.postReviews();
+  }
+
+  private async validateReviews(files: ChangedFile[], listToken: number): Promise<void> {
+    const epoch = this.reviewEpoch;
+    for (const [rel, record] of [...this.reviews]) {
+      const file = files.find((f) => f.relPath === rel);
+      const fingerprint = file ? await this.fingerprint(file) : undefined;
+      if (epoch !== this.reviewEpoch || listToken !== this.listSeq || this.disposed) return;
+      if (!file || !fingerprint || fingerprint !== record.fingerprint
+          || file.status !== record.status || file.origPath !== record.origPath) {
+        this.dropReview(rel);
+      } else this.verifiedReviews.add(rel);
+    }
+    this.persistReviews();
+    this.postReviews();
   }
 
   /**
@@ -209,7 +362,7 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
     } catch {
       return; // repo vanished / git missing — auto-refresh just degrades to manual.
     }
-    if (token !== this.gitWatcherSeq) return;
+    if (token !== this.gitWatcherSeq || this.disposed) return;
     const subs: vscode.Disposable[] = [];
     const onGitEvent = (): void => this.scheduleAutoRefresh(true);
     for (const [base, glob] of [
@@ -352,12 +505,14 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
   async setTarget(picked: PickedRef, repoRoot: string): Promise<void> {
     this.invalidate();
     this.files = [];
+    if (this.target?.repoRoot !== repoRoot || this.target?.ref !== picked.ref) this.resetReviews();
     this.target = {
       ref: picked.ref,
       display: picked.display,
       repoRoot,
       ...(picked.branch ? { branch: picked.branch } : {}),
     };
+    this.persistReviews();
     await this.workspaceState.update(STATE_KEY, this.target);
     this._onDidChangeTarget.fire();
     void this.installGitWatcher();
@@ -366,7 +521,9 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
 
   async clearTarget(): Promise<void> {
     this.invalidate();
+    this.resetReviews();
     this.target = undefined;
+    this.persistReviews();
     await this.workspaceState.update(STATE_KEY, undefined);
     this._onDidChangeTarget.fire();
     void this.installGitWatcher();
@@ -428,6 +585,8 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
         out.push({ relPath: rel, absPath: abs, status: '?' });
       }
       out.sort(byRelPath);
+      await this.validateReviews(out, token);
+      if (token !== this.listSeq) return;
       this.files = out;
       await this.applyFilter();
     } catch (err) {
@@ -452,7 +611,7 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
 
   private async onMessage(msg: unknown): Promise<void> {
     if (!msg || typeof msg !== 'object') return;
-    const m = msg as { type?: string; filter?: Partial<FilterState>; relPath?: string };
+    const m = msg as { type?: string; filter?: Partial<FilterState>; relPath?: string; reviewed?: boolean; reviewContext?: number };
     switch (m.type) {
       case 'ready':
         this.post({ type: 'init', filter: this.filter, viewMode: this.viewMode });
@@ -471,6 +630,12 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
         await this.applyFilter();
         break;
       }
+      case 'setReviewed':
+        if (typeof m.relPath === 'string' && typeof m.reviewed === 'boolean'
+            && typeof m.reviewContext === 'number') {
+          await this.setReviewed(m.relPath, m.reviewed, m.reviewContext);
+        }
+        break;
       case 'openFile': {
         if (!m.relPath) return;
         const file = this.files.find((f) => f.relPath === m.relPath);
@@ -514,7 +679,7 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
     if (token !== this.filterSeq) return;
     this.post({
       type: 'files',
-      files: result.files.map((f) => ({ relPath: f.relPath, status: f.status })),
+      files: result.files.map((f) => ({ relPath: f.relPath, status: f.status, reviewed: this.verifiedReviews.has(f.relPath) })),
       hasTarget: !!this.target,
       targetLabel: this.target?.display ?? '',
       ...(result.error ? { searchError: result.error } : {}),
@@ -536,7 +701,7 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
     const active = this.effectiveActiveRelPath();
     let out: OutgoingMessage = msg;
     if (msg.type === 'files') {
-      const extra: Partial<FilesMessage> = {};
+      const extra: Partial<FilesMessage> = { reviewContext: this.reviewContext };
       if (active !== undefined) extra.activeRelPath = active;
       if (this.target) {
         const root = this.target.repoRoot;
@@ -894,6 +1059,11 @@ body {
      actions — revert is destructive, so it shouldn't invite a stray click. */
   opacity: 0;
 }
+.review-checkbox { flex: 0 0 auto; margin: 0 6px 0 0; accent-color: var(--vscode-input-foreground); }
+.review-checkbox:focus-visible {
+  outline: 1px solid cyan;
+  outline-offset: 2px;
+}
 .revert-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
 #files-list li:hover .revert-btn,
 #files-list li:focus .revert-btn,
@@ -1095,6 +1265,7 @@ body {
     if (!target || !target.closest) return;
     // Revert button takes precedence — it sits inside the row, so without
     // this guard the click would bubble up and open the diff instead.
+    if (target.closest('.review-checkbox')) return;
     const rb = target.closest('.revert-btn');
     if (rb) {
       const rli = rb.closest('li[data-rel]');
@@ -1106,6 +1277,14 @@ body {
     if (isDirRow(li)) toggleDir(li);
     else activateRow(li);
   });
+  $('files-list').addEventListener('change', (event) => {
+    const checkbox = event.target;
+    if (!checkbox || !checkbox.closest || !checkbox.closest('.review-checkbox')) return;
+    const row = checkbox.closest('li[data-rel]');
+    if (row && lastPayload) vscode.postMessage({ type: 'setReviewed',
+      relPath: row.getAttribute('data-rel'), reviewed: checkbox.checked,
+      reviewContext: lastPayload.reviewContext });
+  });
   // Keyboard: Enter/Space opens a file's diff or toggles a folder, matching
   // VSCode tree semantics. ArrowUp/ArrowDown walk the rows; ArrowLeft
   // collapses a folder or jumps to the parent folder; ArrowRight expands a
@@ -1115,7 +1294,7 @@ body {
     // Keys pressed while the revert button is focused are its own concern:
     // Enter/Space fire a native click (handled above), and we don't want
     // arrow-nav or row activation to steal them.
-    if (target && target.closest && target.closest('.revert-btn')) return;
+    if (target && target.closest && (target.closest('.revert-btn') || target.closest('.review-checkbox'))) return;
     const li = target && target.closest ? target.closest(ROW_SEL) : null;
     if (!li) return;
     const dir = isDirRow(li);
@@ -1354,6 +1533,13 @@ body {
       tw.className = 'twistie leaf';
       li.appendChild(tw);
     }
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'review-checkbox';
+    checkbox.checked = !!f.reviewed;
+    checkbox.title = 'Reviewed';
+    checkbox.setAttribute('aria-label', 'Reviewed: ' + f.relPath);
+    li.appendChild(checkbox);
     const s = document.createElement('span');
     s.className = 'status ' + statusClass(f.status);
     s.textContent = f.status;
@@ -1396,6 +1582,14 @@ body {
     } else if (m.type === 'files') {
       activeRelPath = m.activeRelPath != null ? m.activeRelPath : null;
       render(m);
+    } else if (m.type === 'reviews') {
+      if (!lastPayload || m.reviewContext !== lastPayload.reviewContext) return;
+      const paths = new Set(m.paths || []);
+      for (const f of lastPayload.files || []) f.reviewed = paths.has(f.relPath);
+      for (const row of $('files-list').children) {
+        const checkbox = row.querySelector('.review-checkbox');
+        if (checkbox) checkbox.checked = paths.has(row.getAttribute('data-rel'));
+      }
     } else if (m.type === 'activeFile') {
       activeRelPath = m.relPath != null ? m.relPath : null;
       applyActiveHighlight();

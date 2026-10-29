@@ -314,3 +314,34 @@ describe('webview file tree — collapse survives compaction', () => {
     assert.deepStrictEqual(JSON.parse(rows(dom)[0].getAttribute('data-chain')!), ['a', 'a/b', 'a/b/c']);
   });
 });
+
+describe('webview review checkboxes', () => {
+  for (const viewMode of ['list', 'tree']) {
+    it(`renders and toggles an accessible checkbox in ${viewMode} mode without opening the diff`, () => {
+      const dom = runWebviewScript(HTML);
+      dom.send({ type: 'init', viewMode });
+      dom.send(filesMessage({ reviewContext: 2, files: [{ relPath: 'src/a.ts', status: 'M', reviewed: true }] }));
+      const list = dom.byId.get('files-list')!;
+      const checkbox = list.find('.review-checkbox')!;
+      assert.strictEqual(checkbox.checked, true);
+      assert.strictEqual(checkbox.getAttribute('aria-label'), 'Reviewed: src/a.ts');
+      checkbox.checked = false;
+      list.dispatch('click', { target: checkbox });
+      list.dispatch('keydown', { target: checkbox, key: ' ', preventDefault() { assert.fail('stole checkbox key'); } });
+      list.dispatch('change', { target: checkbox });
+      assert.deepStrictEqual(dom.posted[dom.posted.length - 1], {
+        type: 'setReviewed', relPath: 'src/a.ts', reviewed: false, reviewContext: 2,
+      });
+      assert.ok(!dom.posted.some((m: any) => m.type === 'openFile'));
+      dom.send({ type: 'reviews', paths: [], reviewContext: 2 });
+      assert.strictEqual(list.find('.review-checkbox'), checkbox, 'update must preserve focus/DOM');
+      assert.strictEqual(checkbox.checked, false);
+      dom.send({ type: 'reviews', paths: ['src/a.ts'], reviewContext: 1 });
+      assert.strictEqual(checkbox.checked, false, 'ignore obsolete target updates');
+      dom.send({ type: 'reviews', paths: ['src/a.ts'], reviewContext: 2 });
+      assert.strictEqual(checkbox.checked, true);
+      dom.send({ type: 'viewMode', viewMode: viewMode === 'list' ? 'tree' : 'list' });
+      assert.strictEqual(list.find('.review-checkbox')!.checked, true);
+    });
+  }
+});
