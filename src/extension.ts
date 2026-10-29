@@ -141,7 +141,7 @@ export function activate(context: vscode.ExtensionContext): GitDiffExports {
     }),
 
     vscode.commands.registerCommand('gitdiff.changedFiles.refresh', () => {
-      void changedFiles.refresh();
+      return changedFiles.refresh();
     }),
     vscode.commands.registerCommand('gitdiff.changedFiles.setTarget', async () => {
       const fileUri = pickAnyWorkspaceFileUri();
@@ -256,8 +256,8 @@ export function activate(context: vscode.ExtensionContext): GitDiffExports {
         try {
           // Revert to the pinned `target.ref` deliberately — NOT a re-resolved
           // branch tip. The sidebar's file list and every diff it opens are
-          // computed against this exact SHA (ChangedFilesProvider holds it for
-          // the target's lifetime), so reverting to it keeps the result
+          // computed against this exact SHA from the last list refresh,
+          // so reverting to it keeps the result
           // consistent with the diff the user is looking at. Re-resolving a
           // branch that advanced since selection would restore content that
           // doesn't match the displayed comparison.

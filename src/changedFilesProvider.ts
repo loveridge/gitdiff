@@ -543,7 +543,9 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
       this.post({ type: 'files', files: [], hasTarget: false, targetLabel: '' });
       return;
     }
-    const { ref, repoRoot, display } = this.target;
+    const target = this.target;
+    const { repoRoot, display, branch } = target;
+    let ref = target.ref;
     // Only blank the list into a "Loading…" state when there is nothing to
     // show yet (first load / target change). Re-refreshes — especially the
     // automatic ones on save and git activity — keep the previous rows on
@@ -561,6 +563,14 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
       });
     }
     try {
+      if (branch) {
+        try {
+          ref = await this.git.verifyRef(repoRoot, branch);
+        } catch {
+          // A deleted or renamed branch keeps its last resolved comparison.
+        }
+        if (token !== this.listSeq) return;
+      }
       const [tracked, untracked, worktrees] = await Promise.all([
         this.git.listChangedPaths(repoRoot, ref),
         this.git.listUntrackedPaths(repoRoot),
@@ -585,6 +595,14 @@ export class ChangedFilesProvider implements vscode.WebviewViewProvider, vscode.
         out.push({ relPath: rel, absPath: abs, status: '?' });
       }
       out.sort(byRelPath);
+      if (ref !== target.ref) {
+        this.resetReviews();
+        this.target = { ...target, ref };
+        this.persistReviews();
+        await this.workspaceState.update(STATE_KEY, this.target);
+        if (token !== this.listSeq) return;
+        this._onDidChangeTarget.fire();
+      }
       await this.validateReviews(out, token);
       if (token !== this.listSeq) return;
       this.files = out;

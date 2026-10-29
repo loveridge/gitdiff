@@ -20,13 +20,14 @@ type Msg = Record<string, unknown>;
 
 /** Enough of GitService for a target to be set and a list to be produced. */
 const fakeGit = {
+  verifyRef: async () => 'a'.repeat(40),
   gitDir: async (repoRoot: string) => `${repoRoot}/.git`,
   listChangedPaths: async () => [{ relPath: 'src/a.ts', status: 'M' as const }],
   listUntrackedPaths: async () => [],
   listWorktrees: async () => [],
 };
 
-function setup(): { provider: any; posted: Msg[] } {
+function setup(): { provider: any; posted: Msg[]; git: any; store: Map<string, unknown> } {
   const posted: Msg[] = [];
   const memento = {
     store: new Map<string, unknown>(),
@@ -37,7 +38,8 @@ function setup(): { provider: any; posted: Msg[] } {
       this.store.set(key, value);
     },
   };
-  const provider = new ChangedFilesProvider(fakeGit, memento, stub.Uri.file('/ext'));
+  const git = { ...fakeGit };
+  const provider = new ChangedFilesProvider(git, memento, stub.Uri.file('/ext'));
   provider.resolveWebviewView({
     webview: {
       options: {},
@@ -53,7 +55,7 @@ function setup(): { provider: any; posted: Msg[] } {
     onDidDispose: () => ({ dispose() {} }),
     onDidChangeVisibility: () => ({ dispose() {} }),
   });
-  return { provider, posted };
+  return { provider, posted, git, store: memento.store };
 }
 
 function lastFilesMessage(posted: Msg[]): Msg {
@@ -63,6 +65,138 @@ function lastFilesMessage(posted: Msg[]): Msg {
 }
 
 const TARGET = { ref: 'a'.repeat(40), display: 'upstream/master', branch: 'upstream/master' };
+
+describe('ChangedFilesProvider branch refresh', () => {
+  it('uses and persists the current branch tip for the refreshed list and future diffs', async () => {
+    const { provider, git, store } = setup();
+    try {
+      await provider.setTarget(TARGET, '/repo');
+      const tip = 'b'.repeat(40);
+      const calls: string[][] = [];
+      git.verifyRef = async (...args: string[]) => { calls.push(args); return tip; };
+      git.listChangedPaths = async (root: string, ref: string) => {
+        assert.strictEqual(root, '/repo');
+        assert.strictEqual(ref, tip);
+        return [{ relPath: 'new.ts', status: 'A' }];
+      };
+      let changes = 0;
+      provider.onDidChangeTarget(() => changes++);
+      await provider.refresh();
+      assert.deepStrictEqual(calls, [['/repo', TARGET.branch]]);
+      assert.deepStrictEqual(provider.getCurrentTarget(), { ...TARGET, ref: tip });
+      assert.deepStrictEqual(store.get('gitdiff.changedFiles.target'), { ...TARGET, ref: tip, repoRoot: '/repo' });
+      assert.deepStrictEqual(provider.getAllFiles().map((f: any) => f.relPath), ['new.ts']);
+      assert.strictEqual(changes, 1);
+      await provider.refresh();
+      assert.strictEqual(changes, 1, 'an unchanged tip should not fire another target change');
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it('keeps commit comparisons pinned and deleted branches at their last resolved tip', async () => {
+    const { provider, git } = setup();
+    try {
+      let resolutions = 0;
+      git.verifyRef = async () => { resolutions++; throw new Error('missing branch'); };
+      const pinned = { ref: TARGET.ref, display: 'commit' };
+      await provider.setTarget(pinned, '/repo');
+      await provider.refresh();
+      assert.strictEqual(resolutions, 0);
+      assert.deepStrictEqual(provider.getCurrentTarget(), pinned);
+      await provider.setTarget(TARGET, '/repo');
+      await provider.refresh();
+      assert.strictEqual(resolutions, 2);
+      assert.deepStrictEqual(provider.getCurrentTarget(), TARGET);
+      assert.strictEqual(provider.getAllFiles().length, 1);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it('discards a branch resolution if the target was replaced or cleared while awaiting it', async () => {
+    const { provider, git, store } = setup();
+    try {
+      await provider.setTarget(TARGET, '/repo');
+      let finish!: (ref: string) => void;
+      git.verifyRef = () => new Promise<string>((resolve) => { finish = resolve; });
+      let pending = provider.refresh();
+      const pinned = { ref: 'c'.repeat(40), display: 'commit' };
+      await provider.setTarget(pinned, '/other');
+      finish('b'.repeat(40));
+      await pending;
+      assert.deepStrictEqual(provider.getCurrentTarget(), pinned);
+      assert.deepStrictEqual(store.get('gitdiff.changedFiles.target'), { ...pinned, repoRoot: '/other' });
+
+      git.verifyRef = fakeGit.verifyRef;
+      await provider.setTarget(TARGET, '/repo');
+      git.verifyRef = () => new Promise<string>((resolve) => { finish = resolve; });
+      pending = provider.refresh();
+      await provider.clearTarget();
+      finish('b'.repeat(40));
+      await pending;
+      assert.strictEqual(provider.getCurrentTarget(), undefined);
+      assert.strictEqual(store.get('gitdiff.changedFiles.target'), undefined);
+      assert.deepStrictEqual(provider.getAllFiles(), []);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it('retains the previous comparison when a quiet refresh fails to build the new list', async () => {
+    const { provider, git, store } = setup();
+    try {
+      await provider.setTarget(TARGET, '/repo');
+      git.verifyRef = async () => 'b'.repeat(40);
+      git.listChangedPaths = async () => { throw new Error('transient failure'); };
+      await provider.refresh({ quiet: true });
+      assert.deepStrictEqual(provider.getCurrentTarget(), TARGET);
+      assert.deepStrictEqual(store.get('gitdiff.changedFiles.target'), { ...TARGET, repoRoot: '/repo' });
+      assert.strictEqual(provider.getAllFiles().length, 1);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  it('removes stale changes after the comparison branch moves in a real repository', async () => {
+    const fs = require('fs') as typeof import('fs');
+    const os = require('os') as typeof import('os');
+    const path = require('path') as typeof import('path');
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    const { GitService } = require('../../src/gitService');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitdiff-refresh-'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+    const store = new Map<string, unknown>();
+    const provider = new ChangedFilesProvider(new GitService(), {
+      get: (key: string) => store.get(key),
+      update: async (key: string, value: unknown) => { store.set(key, value); },
+    }, stub.Uri.file('/ext'));
+    try {
+      git(['init', '-q', '-b', 'main']);
+      git(['config', 'user.name', 'Test']);
+      git(['config', 'user.email', 'test@example.com']);
+      git(['config', 'commit.gpgsign', 'false']);
+      git(['config', 'core.autocrlf', 'false']);
+      fs.writeFileSync(path.join(root, 'a.txt'), 'original\n');
+      git(['add', '.']);
+      git(['commit', '-qm', 'original']);
+      const original = git(['rev-parse', 'HEAD']);
+      git(['checkout', '-qb', 'feature']);
+      fs.writeFileSync(path.join(root, 'a.txt'), 'updated\n');
+      git(['commit', '-qam', 'updated']);
+      await provider.setTarget({ ref: original, display: 'main', branch: 'main' }, root);
+      assert.deepStrictEqual(provider.getAllFiles().map((f: any) => f.relPath), ['a.txt']);
+      const tip = git(['rev-parse', 'HEAD']);
+      git(['update-ref', 'refs/heads/main', tip]);
+      await provider.refresh();
+      assert.deepStrictEqual(provider.getAllFiles(), []);
+      assert.strictEqual(provider.getCurrentTarget().ref, tip);
+    } finally {
+      provider.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('ChangedFilesProvider target messages', () => {
   it('names the target repo so a cross-repo pin is visible in the view', async () => {
@@ -334,6 +468,23 @@ describe('ChangedFilesProvider reviews', () => {
     assert.ok(provider.verifiedReviews.has('src/a.ts'));
     const staleContext = provider.reviewContext;
     await provider.setTarget({ ref: 'b'.repeat(40), display: 'other' }, root);
+    await provider.onMessage({ type: 'setReviewed', relPath: 'src/a.ts', reviewed: true,
+      reviewContext: staleContext });
+    assert.strictEqual(provider.reviews.size, 0);
+  });
+  it('clears reviews and rejects stale checkbox requests when the branch tip changes', async () => {
+    const provider = make();
+    await provider.setTarget(TARGET, root);
+    await check(provider);
+    const staleContext = provider.reviewContext;
+    provider.git.verifyRef = async () => 'b'.repeat(40);
+    await provider.refresh();
+    await provider.reviewWrites;
+    assert.strictEqual(provider.reviews.size, 0);
+    assert.strictEqual(provider.verifiedReviews.size, 0);
+    assert.strictEqual(provider.reviewWatchers.size, 0);
+    assert.strictEqual(store.get('gitdiff.changedFiles.reviews') &&
+      (store.get('gitdiff.changedFiles.reviews') as any).ref, 'b'.repeat(40));
     await provider.onMessage({ type: 'setReviewed', relPath: 'src/a.ts', reviewed: true,
       reviewContext: staleContext });
     assert.strictEqual(provider.reviews.size, 0);
