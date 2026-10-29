@@ -1060,9 +1060,10 @@ body {
   opacity: 0;
 }
 .review-checkbox { flex: 0 0 auto; margin: 0 6px 0 0; accent-color: var(--vscode-input-foreground); }
-.review-checkbox:focus-visible {
-  outline: 1px solid cyan;
-  outline-offset: 2px;
+/* Mouse clicks focus checkboxes too; :focus-visible alone misses that state. */
+.review-checkbox:focus {
+  outline: none;
+  box-shadow: none;
 }
 .revert-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
 #files-list li:hover .revert-btn,
