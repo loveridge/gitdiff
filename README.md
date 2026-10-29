@@ -123,6 +123,7 @@ When a GitDiff diff is the active editor:
 | `gitdiff.commitPickerLimit` | number | `100` | Maximum number of recent commits shown in the commit picker (1–5000). |
 | `gitdiff.openAllChanges.enabled` | boolean | `true` | Show the **Open All Changes** button in the Changed Files view — one multi-file diff tab for every listed file (per-file tabs on VS Code < 1.87). Set to `false` to hide the button. |
 | `gitdiff.gitPath` | string | `""` | Absolute path to the `git` executable. Empty resolves from `PATH`. **Machine-scoped** — workspace settings cannot override it. |
+| `gitdiff.blameHover.enabled` | boolean | `true` | Show GitDiff blame popups in diff panes and on inline blame annotations. Set to `false` to hide them while keeping inline blame text and other VS Code hovers. Changes take effect without reloading. |
 
 ## Requirements
 

@@ -101,6 +101,10 @@ export class BlameHoverProvider implements vscode.HoverProvider, vscode.Disposab
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.Hover | undefined> {
+    if (!vscode.workspace.getConfiguration('gitdiff').get<boolean>('blameHover.enabled', true)) {
+      return undefined;
+    }
+
     const target = this.targetForDocument(document);
     if (!target) return undefined;
 

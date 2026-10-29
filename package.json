@@ -236,10 +236,15 @@
           "default": true,
           "description": "Show an \"Open All Changes\" button in the Changed Files view that opens every listed file against the comparison target in one multi-file diff tab (VS Code 1.87+; older versions open one diff tab per file)."
         },
+        "gitdiff.blameHover.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show GitDiff blame popups when hovering lines in GitDiff diff panes or inline blame annotations. Disable to hide these popups while keeping inline blame text and other VS Code hovers."
+        },
         "gitdiff.lineBlame.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Show a dim git-blame annotation (author, date, commit) at the end of the line your cursor is on, in files and GitDiff diff panes. Hover the line for the full commit, a commit/PR link, and an in-editor link to open that commit's diff for the file."
+          "description": "Show a dim git-blame annotation (author, date, commit) at the end of the line your cursor is on, in files and GitDiff diff panes. When gitdiff.blameHover.enabled is enabled, hover for the full commit, a commit/PR link, and an in-editor link to open that commit's diff for the file."
         }
       }
     }

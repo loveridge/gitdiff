@@ -107,7 +107,10 @@ export class CurrentLineBlameController implements vscode.Disposable {
         }
       }),
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (!e.affectsConfiguration('gitdiff.lineBlame')) return;
+        if (
+          !e.affectsConfiguration('gitdiff.lineBlame') &&
+          !e.affectsConfiguration('gitdiff.blameHover')
+        ) return;
         this.enabled = readEnabled();
         // Disabling must also invalidate any pending debounce/in-flight blame,
         // or a refresh scheduled while enabled could repaint after the toggle.
@@ -202,7 +205,10 @@ export class CurrentLineBlameController implements vscode.Disposable {
     if (line >= editor.document.lineCount) return;
 
     let hoverMessage: vscode.MarkdownString | undefined;
-    if (!target.diffPane) {
+    if (
+      !target.diffPane &&
+      vscode.workspace.getConfiguration('gitdiff').get<boolean>('blameHover.enabled', true)
+    ) {
       const links = await buildBlameLinks(info, target.repoRoot, target.relPath, (root) =>
         this.remote(root),
       );

@@ -13,6 +13,7 @@ Module._resolveFilename = function (request: string, ...rest: unknown[]) {
 const { BlameHoverProvider, formatBlameDate, buildBlameLinks } = require('../../src/blameHoverProvider');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { encodeGitdiffUri } = require('../../src/util/uri');
+const { workspace } = require('./_vscode-stub-full');
 
 interface BlameCall {
   repoRoot: string;
@@ -46,6 +47,64 @@ function markdownValue(hover: any): string {
 }
 
 describe('BlameHoverProvider', () => {
+  it('toggles blame hovers for both diff panes without recreating the provider', async () => {
+    const originalGetConfiguration = workspace.getConfiguration;
+    let enabled: boolean | undefined = false;
+    let calls = 0;
+    const blame = async () => {
+      calls++;
+      return {
+        fullSha: '0'.repeat(40),
+        shortSha: '00000000',
+        author: 'Not Committed Yet',
+        summary: 'Uncommitted',
+      };
+    };
+    const left = encodeGitdiffUri({
+      ref: 'a'.repeat(40),
+      repoRoot: '/repo',
+      relPath: 'src/a.ts',
+    });
+    const right = fileUri('/repo/src/a.ts');
+    const provider = new BlameHoverProvider(
+      { blameLine: blame, blameLineForContents: blame },
+      { getActiveGitdiffPair: () => ({ left, right }) },
+    );
+    workspace.getConfiguration = (section: string) => {
+      assert.strictEqual(section, 'gitdiff');
+      return {
+        get(key: string, fallback: boolean) {
+          assert.strictEqual(key, 'blameHover.enabled');
+          return enabled ?? fallback;
+        },
+      };
+    };
+    try {
+      for (const uri of [left, right]) {
+        assert.strictEqual(await provider.provideHover(document(uri), { line: 0 }, token()), undefined);
+      }
+      assert.strictEqual(calls, 0, 'disabled hovers must skip blame lookups');
+
+      enabled = true;
+      for (const uri of [left, right]) {
+        assert.ok(await provider.provideHover(document(uri), { line: 0 }, token()));
+      }
+      assert.strictEqual(calls, 2);
+
+      enabled = false;
+      for (const uri of [left, right]) {
+        assert.strictEqual(await provider.provideHover(document(uri), { line: 0 }, token()), undefined);
+      }
+      assert.strictEqual(calls, 2, 'cached hovers must also respect the setting');
+
+      enabled = undefined;
+      assert.ok(await provider.provideHover(document(left), { line: 0 }, token()));
+    } finally {
+      workspace.getConfiguration = originalGetConfiguration;
+      provider.dispose();
+    }
+  });
+
   it('blames gitdiff documents at the pinned target ref', async () => {
     const calls: BlameCall[] = [];
     const git = {
